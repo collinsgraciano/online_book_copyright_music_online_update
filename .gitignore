@@ -1,5 +1,0 @@
-__pycache__/
-*.py[cod]
-.ipynb_checkpoints/
-audiobook_pipeline_v1.ipynb
-audiobook_pipeline_colab_loader_v2.ipynb
