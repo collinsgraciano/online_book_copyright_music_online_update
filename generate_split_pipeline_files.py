@@ -55,22 +55,6 @@ def sanitize_default_runtime_config(default_config):
     return sanitized
 
 
-def sanitize_loader_config_source(config_source):
-    sanitized_lines = []
-    for line in config_source.splitlines():
-        replaced = False
-        for key in SENSITIVE_DEFAULT_KEYS:
-            match = re.match(rf"({re.escape(key)}\s*=\s*)(.*?)(\s+#@param.*)?$", line)
-            if match:
-                line = f'{match.group(1)}""{match.group(3) or ""}'
-                replaced = True
-                break
-        sanitized_lines.append(line)
-        if replaced:
-            continue
-    return "\n".join(sanitized_lines)
-
-
 def remove_cell_title_line(source):
     lines = source.splitlines()
     if lines and lines[0].startswith("#@title"):
@@ -379,10 +363,6 @@ def build_loader_notebook(nb, config_variable_names):
     ).strip()
 
     new_cells = list(nb["cells"][:5])
-    new_cells[1] = dict(new_cells[1])
-    new_cells[1]["source"] = [
-        line + "\n" for line in sanitize_loader_config_source("".join(new_cells[1]["source"])).splitlines()
-    ]
     new_cells.append(make_code_cell(remote_settings_source))
     new_cells.append(make_code_cell(remote_run_source))
     new_cells.append(make_markdown_cell(loader_markdown))
