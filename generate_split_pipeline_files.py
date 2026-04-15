@@ -244,7 +244,7 @@ def build_loader_notebook(nb, config_variable_names):
     remote_settings_source = textwrap.dedent(
         """
         #@title 5️⃣ 🌐 远端运行核心加载设置
-        REMOTE_PIPELINE_URL = "https://raw.githubusercontent.com/<your-account>/<your-repo>/main/audiobook_pipeline_runtime_core_v2.py"  #@param {type:"string"}
+        REMOTE_PIPELINE_URL = "https://raw.githubusercontent.com/collinsgraciano/online_book_copyright_music_online_update/refs/heads/main/audiobook_pipeline_runtime_core_v2.py"  #@param {type:"string"}
         REMOTE_PIPELINE_LOCAL_PATH = "/content/_remote_pipeline/"  #@param {type:"string"}
         REMOTE_PIPELINE_FORCE_REFRESH = True  #@param {type:"boolean"}
         """
@@ -269,8 +269,6 @@ def build_loader_notebook(nb, config_variable_names):
             remote_url = str(remote_url or "").strip()
             if not remote_url:
                 raise ValueError("REMOTE_PIPELINE_URL 不能为空。")
-            if "<your-account>" in remote_url or "<your-repo>" in remote_url:
-                raise ValueError("请先把 REMOTE_PIPELINE_URL 改成你自己的 GitHub Raw 地址。")
 
             local_root = Path(str(local_root or "/content/_remote_pipeline/").strip() or "/content/_remote_pipeline/")
             filename = os.path.basename(urlparse(remote_url).path) or "audiobook_pipeline_runtime_core_v2.py"
