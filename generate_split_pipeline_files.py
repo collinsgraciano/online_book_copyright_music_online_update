@@ -255,6 +255,7 @@ def build_loader_notebook(nb, config_variable_names):
         #@title 6️⃣ 🚀 下载并运行远端核心
         import importlib.util
         import os
+        import sys
         import time
         from pathlib import Path
         from urllib.parse import urlparse
@@ -321,7 +322,10 @@ def build_loader_notebook(nb, config_variable_names):
 
         module_name = f"audiobook_pipeline_runtime_core_v2_{int(time.time())}"
         spec = importlib.util.spec_from_file_location(module_name, remote_core_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"无法为远端核心创建 importlib spec: {remote_core_path}")
         remote_module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = remote_module
         spec.loader.exec_module(remote_module)
 
         runtime_config = _collect_runtime_config_from_notebook_globals()
