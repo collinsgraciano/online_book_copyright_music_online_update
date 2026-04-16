@@ -14,6 +14,11 @@ DEFAULT_RUNTIME_CONFIG = {'SUPABASE_URL': '',
  'REQUEST_DELAY': 0.3,
  'REQUEST_TIMEOUT': 30,
  'MAX_RETRIES': 3,
+ 'AUDIO_DOWNLOAD_CONNECT_TIMEOUT': 20,
+ 'AUDIO_DOWNLOAD_READ_TIMEOUT': 90,
+ 'AUDIO_DOWNLOAD_MAX_RETRY_ATTEMPTS': 12,
+ 'AUDIO_DOWNLOAD_MAX_TOTAL_SECONDS': 1800,
+ 'AUDIO_DOWNLOAD_STUCK_LOG_INTERVAL_SECONDS': 30,
  'SKIP_EXISTING': True,
  'FORCE_REPROCESS': False,
  'MAX_RUNTIME_HOURS': 11.5,
@@ -561,56 +566,73 @@ def download_file(url: str, save_path: str, retries: int = MAX_RETRIES) -> bool:
     return False
 
 
-def download_audio_file(url: str, save_path: str, timeout_seconds: int = 300) -> bool:
+def download_audio_file(url: str, save_path: str, timeout_seconds: int = 300) -> dict:
     """
     章节音频专用下载：
-    - 单次请求超时固定 300 秒
-    - 失败后无限重试，直到成功
+    - 单次请求拆分为连接超时 + 读超时
+    - 失败后按上限重试，避免单个坏链接无限卡死整本书
     - 继续使用临时文件 + rename，避免生成坏文件
     """
     if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
-        return True
+        return {"ok": True, "attempts": 0, "elapsed_seconds": 0.0, "error": ""}
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     tmp_path = save_path + ".tmp"
     attempt = 0
+    started_at = time.time()
+    last_error = ""
+    connect_timeout = max(3, int(globals().get("AUDIO_DOWNLOAD_CONNECT_TIMEOUT", 20) or 20))
+    read_timeout = max(5, int(globals().get("AUDIO_DOWNLOAD_READ_TIMEOUT", timeout_seconds) or timeout_seconds))
+    max_attempts = max(1, int(globals().get("AUDIO_DOWNLOAD_MAX_RETRY_ATTEMPTS", 12) or 12))
+    max_total_seconds = max(read_timeout, int(globals().get("AUDIO_DOWNLOAD_MAX_TOTAL_SECONDS", 1800) or 1800))
 
-    while True:
+    while attempt < max_attempts:
         attempt += 1
         try:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
-            resp = requests.get(url, timeout=timeout_seconds, stream=True)
-            resp.raise_for_status()
-            with open(tmp_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=64 * 1024):
-                    if chunk:
-                        f.write(chunk)
+            with requests.get(url, timeout=(connect_timeout, read_timeout), stream=True) as resp:
+                resp.raise_for_status()
+                with open(tmp_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=64 * 1024):
+                        if chunk:
+                            f.write(chunk)
 
-            expected = resp.headers.get("Content-Length")
+                expected = resp.headers.get("Content-Length")
             actual = os.path.getsize(tmp_path)
             if expected and int(expected) != actual:
+                last_error = f"文件大小不匹配: 预期={expected} 实际={actual}"
                 log.warning(
-                    "章节音频下载大小不匹配，将无限重试: 预期=%s 实际=%s 文件=%s",
+                    "章节音频下载大小不匹配，将继续重试: 预期=%s 实际=%s 文件=%s",
                     expected,
                     actual,
                     os.path.basename(save_path),
                 )
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
-                time.sleep(min(60, max(2, attempt)))
+                wait = min(60, max(2, 2 ** min(attempt - 1, 5)))
+                if attempt >= max_attempts or (time.time() - started_at + wait) > max_total_seconds:
+                    break
+                time.sleep(wait)
                 continue
 
             shutil.move(tmp_path, save_path)
             if attempt > 1:
                 log.info("章节音频下载重试后成功: %s（第 %d 次）", os.path.basename(save_path), attempt)
-            return True
+            return {
+                "ok": True,
+                "attempts": attempt,
+                "elapsed_seconds": round(time.time() - started_at, 1),
+                "error": "",
+            }
         except Exception as e:
+            last_error = str(e)
             wait = min(60, max(2, 2 ** min(attempt - 1, 5)))
             log.warning(
-                "章节音频下载失败，将继续无限重试（第 %d 次，%ds 后重试）: %s | %s",
+                "章节音频下载失败，将继续重试（第 %d/%d 次，%ds 后重试）: %s | %s",
                 attempt,
+                max_attempts,
                 wait,
                 os.path.basename(save_path),
                 e,
@@ -620,9 +642,31 @@ def download_audio_file(url: str, save_path: str, timeout_seconds: int = 300) ->
                     os.remove(tmp_path)
                 except Exception:
                     pass
+            if attempt >= max_attempts or (time.time() - started_at + wait) > max_total_seconds:
+                break
             time.sleep(wait)
 
+    elapsed_seconds = round(time.time() - started_at, 1)
+    if os.path.exists(tmp_path):
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
+    log.error(
+        "章节音频下载达到上限，停止重试: %s | 已尝试 %d 次，耗时 %.1fs | 最后错误: %s",
+        os.path.basename(save_path),
+        attempt,
+        elapsed_seconds,
+        last_error or "未知错误",
+    )
+
+    return {
+        "ok": False,
+        "attempts": attempt,
+        "elapsed_seconds": elapsed_seconds,
+        "error": last_error or "未知错误",
+    }
 def merge_audio_ffmpeg(mp3_paths: list, output_path: str) -> bool:
     """
     使用 ffmpeg concat demuxer 合并多个 mp3 文件。
@@ -1795,6 +1839,11 @@ def collect_runtime_config_snapshot():
         "prioritize_interrupted_books": PRIORITIZE_INTERRUPTED_BOOKS,
         "output_root": OUTPUT_ROOT,
         "download_workers": DOWNLOAD_WORKERS,
+        "audio_download_connect_timeout": AUDIO_DOWNLOAD_CONNECT_TIMEOUT,
+        "audio_download_read_timeout": AUDIO_DOWNLOAD_READ_TIMEOUT,
+        "audio_download_max_retry_attempts": AUDIO_DOWNLOAD_MAX_RETRY_ATTEMPTS,
+        "audio_download_max_total_seconds": AUDIO_DOWNLOAD_MAX_TOTAL_SECONDS,
+        "audio_download_stuck_log_interval_seconds": AUDIO_DOWNLOAD_STUCK_LOG_INTERVAL_SECONDS,
         "hf_music_download_enabled": DOWNLOAD_FROM_BUCKETS,
         "hf_music_download_method": HF_MUSIC_DOWNLOAD_METHOD,
         "enable_deepfilter": ENABLE_DEEPFILTER,
@@ -1942,6 +1991,36 @@ def validate_runtime_config():
         errors.append("已开启 YouTube 上传，但 YOUTUBE_CHANNEL_NAME 为空")
     if str(OUTPUT_ROOT).strip().startswith("/content") and "/drive/" not in str(OUTPUT_ROOT).strip():
         warnings.append("当前 OUTPUT_ROOT 位于 Colab 临时盘，断线或重启后文件会丢；长期自用更建议改到 Google Drive 路径")
+    try:
+        audio_connect_timeout = int(AUDIO_DOWNLOAD_CONNECT_TIMEOUT or 0)
+    except Exception:
+        audio_connect_timeout = 0
+    try:
+        audio_read_timeout = int(AUDIO_DOWNLOAD_READ_TIMEOUT or 0)
+    except Exception:
+        audio_read_timeout = 0
+    try:
+        audio_max_attempts = int(AUDIO_DOWNLOAD_MAX_RETRY_ATTEMPTS or 0)
+    except Exception:
+        audio_max_attempts = 0
+    try:
+        audio_max_total_seconds = int(AUDIO_DOWNLOAD_MAX_TOTAL_SECONDS or 0)
+    except Exception:
+        audio_max_total_seconds = 0
+    try:
+        audio_stuck_log_interval = int(AUDIO_DOWNLOAD_STUCK_LOG_INTERVAL_SECONDS or 0)
+    except Exception:
+        audio_stuck_log_interval = 0
+    if audio_connect_timeout <= 0:
+        errors.append("AUDIO_DOWNLOAD_CONNECT_TIMEOUT 必须大于 0")
+    if audio_read_timeout <= 0:
+        errors.append("AUDIO_DOWNLOAD_READ_TIMEOUT 必须大于 0")
+    if audio_max_attempts <= 0:
+        errors.append("AUDIO_DOWNLOAD_MAX_RETRY_ATTEMPTS 必须大于 0")
+    if audio_max_total_seconds <= 0:
+        errors.append("AUDIO_DOWNLOAD_MAX_TOTAL_SECONDS 必须大于 0")
+    if audio_stuck_log_interval <= 0:
+        errors.append("AUDIO_DOWNLOAD_STUCK_LOG_INTERVAL_SECONDS 必须大于 0")
     music_download_method = str(HF_MUSIC_DOWNLOAD_METHOD or "datasets_zip_urls").strip().lower()
     if DOWNLOAD_FROM_BUCKETS:
         if hf_dataset_zip_urls_source not in {"supabase", "local"}:
@@ -3786,30 +3865,95 @@ def download_chapter_items(chapter_items, chapters_dir):
         return []
 
     os.makedirs(chapters_dir, exist_ok=True)
+    stuck_log_interval = max(10, int(globals().get("AUDIO_DOWNLOAD_STUCK_LOG_INTERVAL_SECONDS", 30) or 30))
 
     def dl_one(item):
         mp3_url = item["chapter"].get("mp3Url", "")
         title = item.get("title") or f"chapter_{item['source_index']:04d}"
         if not mp3_url:
-            return item["source_index"], None
+            return {
+                "source_index": item["source_index"],
+                "title": title,
+                "path": None,
+                "attempts": 0,
+                "elapsed_seconds": 0.0,
+                "error": "章节缺少 mp3Url",
+            }
 
         path = os.path.join(chapters_dir, f"{item['source_index']:04d}_{sanitize_filename(title)}.mp3")
-        ok = download_audio_file(mp3_url, path, timeout_seconds=300)
+        result = download_audio_file(mp3_url, path, timeout_seconds=300)
         time.sleep(REQUEST_DELAY)
-        return item["source_index"], path if ok else None
+        return {
+            "source_index": item["source_index"],
+            "title": title,
+            "path": path if result["ok"] else None,
+            "attempts": result["attempts"],
+            "elapsed_seconds": result["elapsed_seconds"],
+            "error": result["error"],
+        }
 
     paths_map = {}
+    failures = {}
+    total = len(chapter_items)
     with concurrent.futures.ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as exe:
-        futures = {exe.submit(dl_one, item): item["source_index"] for item in chapter_items}
-        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="并发下载分片章节", unit="章"):
-            idx, path = future.result()
-            paths_map[idx] = path
+        futures = {
+            exe.submit(dl_one, item): {
+                "source_index": item["source_index"],
+                "title": item.get("title") or f"chapter_{item['source_index']:04d}",
+                "submitted_at": time.time(),
+            }
+            for item in chapter_items
+        }
+        pending = set(futures.keys())
+        with tqdm(total=total, desc="并发下载分片章节", unit="章") as progress:
+            while pending:
+                done, pending = concurrent.futures.wait(
+                    pending,
+                    timeout=stuck_log_interval,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+
+                if done:
+                    for future in done:
+                        result = future.result()
+                        idx = result["source_index"]
+                        paths_map[idx] = result["path"]
+                        if not result["path"]:
+                            failures[idx] = result
+                        progress.update(1)
+                    continue
+
+                pending_samples = []
+                now = time.time()
+                for future in sorted(pending, key=lambda item: futures[item]["source_index"])[:5]:
+                    meta = futures[future]
+                    pending_samples.append(
+                        f"{meta['source_index']:04d}_{sanitize_filename(meta['title'])}({int(now - meta['submitted_at'])}s)"
+                    )
+
+                log.warning(
+                    "并发下载仍在等待 %d/%d 个章节完成，可能有线程正在长时间重试或网络静默。当前等待中: %s",
+                    len(pending),
+                    total,
+                    " | ".join(pending_samples) if pending_samples else "无",
+                )
 
     ordered_indexes = [item["source_index"] for item in chapter_items]
     chapter_paths = [paths_map[idx] for idx in ordered_indexes if paths_map.get(idx)]
     if len(chapter_paths) != len(ordered_indexes):
-        missing_indexes = [str(idx) for idx in ordered_indexes if not paths_map.get(idx)]
-        raise RuntimeError(f"章节下载不完整，缺失章节索引: {', '.join(missing_indexes)}")
+        missing_details = []
+        for idx in ordered_indexes:
+            if paths_map.get(idx):
+                continue
+            failed = failures.get(idx)
+            if failed:
+                missing_details.append(
+                    f"{idx:04d}_{sanitize_filename(failed['title'])}"
+                    f"(重试{failed['attempts']}次, 耗时{int(failed['elapsed_seconds'])}s, {failed['error']})"
+                )
+            else:
+                missing_details.append(f"{idx:04d}_未知章节(未返回结果)")
+        raise RuntimeError(f"章节下载不完整，失败章节: {'; '.join(missing_details)}")
 
     return chapter_paths
 
