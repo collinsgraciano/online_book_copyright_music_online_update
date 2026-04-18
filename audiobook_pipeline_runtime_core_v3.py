@@ -13,10 +13,10 @@ DEFAULT_RUNTIME_CONFIG = {'SUPABASE_URL': '',
  'DOWNLOAD_WORKERS': 4,
  'REQUEST_DELAY': 0.3,
  'REQUEST_TIMEOUT': 30,
- 'MODELSCOPE_IMAGE_CONNECT_TIMEOUT': 30,
- 'MODELSCOPE_IMAGE_READ_TIMEOUT': 120,
- 'MODELSCOPE_IMAGE_POLL_CONNECT_TIMEOUT': 30,
- 'MODELSCOPE_IMAGE_POLL_READ_TIMEOUT': 120,
+ 'MODELSCOPE_IMAGE_CONNECT_TIMEOUT': 300,
+ 'MODELSCOPE_IMAGE_READ_TIMEOUT': 300,
+ 'MODELSCOPE_IMAGE_POLL_CONNECT_TIMEOUT': 300,
+ 'MODELSCOPE_IMAGE_POLL_READ_TIMEOUT': 300,
  'MODELSCOPE_TOKEN_SWITCH_DELAY_SECONDS': 30,
  'MAX_RETRIES': 3,
  'AUDIO_DOWNLOAD_CONNECT_TIMEOUT': 20,
@@ -2504,15 +2504,15 @@ def _read_positive_int_runtime_config(name, default_value):
 
 def _get_modelscope_image_request_timeout():
     return (
-        _read_positive_int_runtime_config("MODELSCOPE_IMAGE_CONNECT_TIMEOUT", 30),
-        _read_positive_int_runtime_config("MODELSCOPE_IMAGE_READ_TIMEOUT", 120),
+        _read_positive_int_runtime_config("MODELSCOPE_IMAGE_CONNECT_TIMEOUT", 300),
+        _read_positive_int_runtime_config("MODELSCOPE_IMAGE_READ_TIMEOUT", 300),
     )
 
 
 def _get_modelscope_image_poll_timeout():
     return (
-        _read_positive_int_runtime_config("MODELSCOPE_IMAGE_POLL_CONNECT_TIMEOUT", 30),
-        _read_positive_int_runtime_config("MODELSCOPE_IMAGE_POLL_READ_TIMEOUT", 120),
+        _read_positive_int_runtime_config("MODELSCOPE_IMAGE_POLL_CONNECT_TIMEOUT", 300),
+        _read_positive_int_runtime_config("MODELSCOPE_IMAGE_POLL_READ_TIMEOUT", 300),
     )
 
 
