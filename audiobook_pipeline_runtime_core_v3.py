@@ -13,6 +13,11 @@ DEFAULT_RUNTIME_CONFIG = {'SUPABASE_URL': '',
  'DOWNLOAD_WORKERS': 4,
  'REQUEST_DELAY': 0.3,
  'REQUEST_TIMEOUT': 30,
+ 'MODELSCOPE_IMAGE_CONNECT_TIMEOUT': 30,
+ 'MODELSCOPE_IMAGE_READ_TIMEOUT': 120,
+ 'MODELSCOPE_IMAGE_POLL_CONNECT_TIMEOUT': 30,
+ 'MODELSCOPE_IMAGE_POLL_READ_TIMEOUT': 120,
+ 'MODELSCOPE_TOKEN_SWITCH_DELAY_SECONDS': 30,
  'MAX_RETRIES': 3,
  'AUDIO_DOWNLOAD_CONNECT_TIMEOUT': 20,
  'AUDIO_DOWNLOAD_READ_TIMEOUT': 90,
@@ -1856,6 +1861,11 @@ def collect_runtime_config_snapshot():
         "cloud_runtime_settings_table": CLOUD_RUNTIME_SETTINGS_TABLE,
         "modelscope_token_source": MODELSCOPE_TOKEN_SOURCE,
         "modelscope_token_table": MODELSCOPE_TOKEN_TABLE,
+        "modelscope_image_connect_timeout": MODELSCOPE_IMAGE_CONNECT_TIMEOUT,
+        "modelscope_image_read_timeout": MODELSCOPE_IMAGE_READ_TIMEOUT,
+        "modelscope_image_poll_connect_timeout": MODELSCOPE_IMAGE_POLL_CONNECT_TIMEOUT,
+        "modelscope_image_poll_read_timeout": MODELSCOPE_IMAGE_POLL_READ_TIMEOUT,
+        "modelscope_token_switch_delay_seconds": MODELSCOPE_TOKEN_SWITCH_DELAY_SECONDS,
         "enable_seo_generation": ENABLE_SEO_GENERATION,
         "hf_dataset_zip_urls_source": HF_DATASET_ZIP_URLS_SOURCE,
         "bucket_ids_source": BUCKET_IDS_SOURCE,
@@ -2017,6 +2027,22 @@ def validate_runtime_config():
         audio_stuck_log_interval = int(AUDIO_DOWNLOAD_STUCK_LOG_INTERVAL_SECONDS or 0)
     except Exception:
         audio_stuck_log_interval = 0
+    try:
+        modelscope_image_connect_timeout = int(MODELSCOPE_IMAGE_CONNECT_TIMEOUT or 0)
+    except Exception:
+        modelscope_image_connect_timeout = 0
+    try:
+        modelscope_image_read_timeout = int(MODELSCOPE_IMAGE_READ_TIMEOUT or 0)
+    except Exception:
+        modelscope_image_read_timeout = 0
+    try:
+        modelscope_image_poll_connect_timeout = int(MODELSCOPE_IMAGE_POLL_CONNECT_TIMEOUT or 0)
+    except Exception:
+        modelscope_image_poll_connect_timeout = 0
+    try:
+        modelscope_image_poll_read_timeout = int(MODELSCOPE_IMAGE_POLL_READ_TIMEOUT or 0)
+    except Exception:
+        modelscope_image_poll_read_timeout = 0
     if audio_connect_timeout <= 0:
         errors.append("AUDIO_DOWNLOAD_CONNECT_TIMEOUT 必须大于 0")
     if audio_read_timeout <= 0:
@@ -2027,6 +2053,14 @@ def validate_runtime_config():
         errors.append("AUDIO_DOWNLOAD_MAX_TOTAL_SECONDS 必须大于 0")
     if audio_stuck_log_interval <= 0:
         errors.append("AUDIO_DOWNLOAD_STUCK_LOG_INTERVAL_SECONDS 必须大于 0")
+    if modelscope_image_connect_timeout <= 0:
+        errors.append("MODELSCOPE_IMAGE_CONNECT_TIMEOUT 蹇呴』澶т簬 0")
+    if modelscope_image_read_timeout <= 0:
+        errors.append("MODELSCOPE_IMAGE_READ_TIMEOUT 蹇呴』澶т簬 0")
+    if modelscope_image_poll_connect_timeout <= 0:
+        errors.append("MODELSCOPE_IMAGE_POLL_CONNECT_TIMEOUT 蹇呴』澶т簬 0")
+    if modelscope_image_poll_read_timeout <= 0:
+        errors.append("MODELSCOPE_IMAGE_POLL_READ_TIMEOUT 蹇呴』澶т簬 0")
     music_download_method = str(HF_MUSIC_DOWNLOAD_METHOD or "datasets_zip_urls").strip().lower()
     if DOWNLOAD_FROM_BUCKETS:
         if hf_dataset_zip_urls_source not in {"supabase", "local"}:
@@ -2445,6 +2479,49 @@ def is_modelscope_daily_quota_exceeded_error(error):
     )
 
 
+def is_modelscope_http_429_error(error):
+    text = str(error or "")
+    lowered = text.lower()
+    return (
+        is_modelscope_daily_quota_exceeded_error(error)
+        or "429 client error" in lowered
+        or "too many requests" in lowered
+        or "status code 429" in lowered
+        or "error code: 429" in lowered
+        or "'code': 429" in lowered
+        or '"code":429' in lowered
+        or '"code": 429' in lowered
+    )
+
+
+def _read_positive_int_runtime_config(name, default_value):
+    try:
+        value = int(globals().get(name, default_value) or default_value)
+    except Exception:
+        value = default_value
+    return max(1, value)
+
+
+def _get_modelscope_image_request_timeout():
+    return (
+        _read_positive_int_runtime_config("MODELSCOPE_IMAGE_CONNECT_TIMEOUT", 30),
+        _read_positive_int_runtime_config("MODELSCOPE_IMAGE_READ_TIMEOUT", 120),
+    )
+
+
+def _get_modelscope_image_poll_timeout():
+    return (
+        _read_positive_int_runtime_config("MODELSCOPE_IMAGE_POLL_CONNECT_TIMEOUT", 30),
+        _read_positive_int_runtime_config("MODELSCOPE_IMAGE_POLL_READ_TIMEOUT", 120),
+    )
+
+
+def _sleep_before_next_modelscope_token():
+    delay_seconds = _read_positive_int_runtime_config("MODELSCOPE_TOKEN_SWITCH_DELAY_SECONDS", 30)
+    log.info("⏳ 不同 token 之间等待 %d 秒，随后继续切换下一个 token...", delay_seconds)
+    time.sleep(delay_seconds)
+
+
 def _run_qwen_task_with_token_rotation(task_label, token_pool, attempt, runner, max_quota_rounds=2):
     active_tokens = normalize_modelscope_token_pool(token_pool)
     if not active_tokens:
@@ -2703,6 +2780,316 @@ def auto_create_youtube_cover(book_name, book_desc, output_path, token, resoluti
 import os
 import json
 import time
+
+
+def _run_qwen_task_with_token_rotation(task_label, token_pool, attempt, runner, max_quota_rounds=2):
+    active_tokens = normalize_modelscope_token_pool(token_pool)
+    if not active_tokens:
+        raise ValueError(f"{task_label} 未提供可用的 ModelScope Token。")
+
+    collected_errors = []
+    last_quota_error = None
+
+    for quota_round in range(1, max_quota_rounds + 1):
+        quota_hit_this_round = False
+
+        for token_index, current_token in enumerate(active_tokens, start=1):
+            try:
+                return runner(current_token), collected_errors
+            except Exception as e:
+                has_next_token = token_index < len(active_tokens)
+                if is_modelscope_daily_quota_exceeded_error(e):
+                    quota_hit_this_round = True
+                    last_quota_error = e
+                    log.warning(
+                        "⚠️ %s 第 %d 次失败：当前 token 触发 Qwen 配额限制，切换下一个 token。轮次=%d/%d，token=%d/%d | 原始错误：%s",
+                        task_label,
+                        attempt,
+                        quota_round,
+                        max_quota_rounds,
+                        token_index,
+                        len(active_tokens),
+                        e,
+                    )
+                    if has_next_token:
+                        _sleep_before_next_modelscope_token()
+                    continue
+
+                collected_errors.append(str(e))
+                log.warning(
+                    "⚠️ %s 第 %d 次失败：%s；准备切换下一个 token。",
+                    task_label,
+                    attempt,
+                    e,
+                )
+                if has_next_token:
+                    _sleep_before_next_modelscope_token()
+
+        if not quota_hit_this_round:
+            return None, collected_errors
+        if quota_round < max_quota_rounds:
+            _sleep_before_next_modelscope_token()
+
+    raise RuntimeError(
+        f"{task_label} 在连续 {max_quota_rounds} 轮切换全部 token 后，仍然触发 "
+        f"Qwen/Qwen3.5-397B-A17B 配额限制，停止运行。最后错误：{last_quota_error}"
+    ) from last_quota_error
+
+
+def _build_youtube_cover_draw_prompt(book_name, book_desc, current_token, attempt):
+    from openai import OpenAI
+
+    client = OpenAI(
+        base_url='https://api-inference.modelscope.cn/v1',
+        api_key=current_token,
+    )
+
+    system_prompt = """角色设定：你是一位顶级 YouTube 封面设计师和 AI 绘图提示词专家。你的任务是根据我提供的书名和简介，输出一段可直接用于高质量文生图模型的英文提示词。
+
+设计原则：
+1. 主体必须直接体现书的内容和情绪，适合 YouTube thumbnail 的高点击构图。
+2. 书名对应的中文大字必须作为画面的核心视觉元素，要求醒目、可读、对比强烈。
+3. 允许补充一个极短的中文副标题增强点击欲。
+4. 输出必须强调高对比、高饱和、戏剧光影、电影感和 16:9 横版构图。
+
+最后约束：
+1. 只输出一段英文 prompt，不要输出解释、分析、列表或前缀。
+2. 必须包含 --ar 16:9。
+3. 画面风格要偏 YouTube thumbnail，而不是普通海报。"""
+
+    user_prompt = f"书名：[{book_name}]\n简介：[{book_desc}]"
+
+    response = client.chat.completions.create(
+        model='Qwen/Qwen3.5-397B-A17B',
+        messages=[
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': user_prompt}
+        ]
+    )
+
+    choices = getattr(response, "choices", None) or []
+    first_choice = choices[0] if choices else None
+    message = getattr(first_choice, "message", None)
+    content = getattr(message, "content", None)
+    if isinstance(content, list):
+        merged_parts = []
+        for item in content:
+            if isinstance(item, dict):
+                merged_parts.append(str(item.get("text") or item.get("content") or ""))
+            else:
+                merged_parts.append(str(getattr(item, "text", "") or getattr(item, "content", "") or ""))
+        content = "".join(merged_parts)
+
+    draw_prompt = str(content or "").strip()
+    if not draw_prompt:
+        raise ValueError("封面提示词接口未返回有效文本内容。")
+
+    log.info("🎨 第 %d 次绘画请求 | 大模型已凝练出绝佳画面神韵：\n%s", attempt, draw_prompt)
+    return draw_prompt
+
+
+def _request_modelscope_cover_image_url(image_model, current_token, draw_prompt, img_size):
+    base_url = 'https://api-inference.modelscope.cn/'
+    common_headers = {
+        "Authorization": f"Bearer {current_token}",
+        "Content-Type": "application/json",
+    }
+    request_timeout = _get_modelscope_image_request_timeout()
+    poll_timeout = _get_modelscope_image_poll_timeout()
+
+    log.info("🌅 正在将渲染任务下派给云端高能图层服务器 (X-ModelScope-Async-Mode)... 模型=%s", image_model)
+    req_res = requests.post(
+        f"{base_url}v1/images/generations",
+        headers={**common_headers, "X-ModelScope-Async-Mode": "true"},
+        data=json.dumps({
+            "model": image_model,
+            "size": img_size,
+            "prompt": draw_prompt
+        }, ensure_ascii=False).encode('utf-8'),
+        timeout=request_timeout,
+    )
+    req_res.raise_for_status()
+    task_id = req_res.json().get("task_id")
+    if not task_id:
+        raise ValueError("云端未返回 task_id。")
+
+    log.info("📡 接收到远端任务队列牌号: %s，系统正原地静默巡检直到图块完工...", task_id)
+
+    polls = 0
+    poll_interval = 5
+    max_polls = 50
+    while polls < max_polls:
+        polls += 1
+        poll_res = requests.get(
+            f"{base_url}v1/tasks/{task_id}",
+            headers={**common_headers, "X-ModelScope-Task-Type": "image_generation"},
+            timeout=poll_timeout,
+        )
+        poll_res.raise_for_status()
+        data = poll_res.json()
+
+        status = data.get("task_status")
+        if status == "SUCCEED":
+            output_images = data.get("output_images") or []
+            if not output_images:
+                raise ValueError(f"{image_model} 已成功完成，但返回结果中缺少 output_images。")
+            img_url = output_images[0]
+            log.info("🖼️ 远端结算完毕，获取到高速下载热链: %s", img_url)
+            return img_url
+        if status == "FAILED":
+            raise ValueError(f"{image_model} 远端画图任务返回 FAILED。")
+
+        time.sleep(poll_interval)
+
+    raise ValueError(f"由于排队压力，远端在 {max_polls * poll_interval} 秒内仍未完成绘图。")
+
+
+def _try_generate_cover_with_image_model(output_path, draw_prompt, img_size, image_model, token_candidates):
+    active_tokens = normalize_modelscope_token_pool(token_candidates)
+    failure_messages = []
+    failure_count = 0
+    http_429_count = 0
+
+    for token_index, current_token in enumerate(active_tokens, start=1):
+        try:
+            img_url = _request_modelscope_cover_image_url(image_model, current_token, draw_prompt, img_size)
+            if download_file(img_url, output_path):
+                log.info(
+                    "🎉 %s 已成功生成 YouTube %s 超清海报图并刻录在案: %s",
+                    image_model,
+                    img_size,
+                    os.path.basename(output_path),
+                )
+                return {
+                    "success": True,
+                    "errors": [],
+                    "failure_count": 0,
+                    "all_failures_are_429": False,
+                }
+
+            raise ValueError("URL 下载到本地图盘时文件被截断了。")
+        except Exception as e:
+            failure_count += 1
+            failure_messages.append(str(e))
+            has_next_token = token_index < len(active_tokens)
+            if is_modelscope_http_429_error(e):
+                http_429_count += 1
+                log.warning(
+                    "⚠️ %s 第 %d 个 token 生图失败：命中 429/限流，准备切换下一个 token。原始错误：%s",
+                    image_model,
+                    token_index,
+                    e,
+                )
+                if has_next_token:
+                    _sleep_before_next_modelscope_token()
+                continue
+
+            log.warning(
+                "⚠️ %s 第 %d 个 token 生图失败：%s；准备切换下一个 token。",
+                image_model,
+                token_index,
+                e,
+            )
+            if has_next_token:
+                _sleep_before_next_modelscope_token()
+
+    return {
+        "success": False,
+        "errors": failure_messages,
+        "failure_count": failure_count,
+        "all_failures_are_429": failure_count > 0 and http_429_count == failure_count,
+    }
+
+
+def auto_create_youtube_cover(book_name, book_desc, output_path, token, resolution="1080p"):
+    token_pool = normalize_modelscope_token_pool(token)
+    if not token_pool:
+        raise ValueError("未提供 ModelScope Token，无法生成 AI 海报。")
+
+    res_to_size = {"720p": "1280x720", "1080p": "1920x1080", "1440p": "2560x1440", "4k": "3840x2160"}
+    img_size = res_to_size.get(str(resolution).lower(), "1920x1080")
+
+    log.info("【🖼️ AI绘图】[%s] 分析有声书意境提取并生成高宽容度爆款 YouTube 封面 (%s)...", book_name, img_size)
+
+    attempt = 0
+    prompt_generation_attempt = 0
+    cached_draw_prompt = ""
+    image_model_sequence = [
+        ("qwen/Qwen-Image-2512", "主生图模型"),
+        ("Tongyi-MAI/Z-Image-Turbo", "回退生图模型"),
+    ]
+
+    while True:
+        attempt += 1
+        current_cycle_errors = []
+        draw_prompt = cached_draw_prompt
+        if not draw_prompt:
+            prompt_generation_attempt += 1
+            draw_prompt, prompt_errors = _run_qwen_task_with_token_rotation(
+                task_label="封面提示词生成",
+                token_pool=token_pool,
+                attempt=prompt_generation_attempt,
+                runner=lambda current_token: _build_youtube_cover_draw_prompt(
+                    book_name,
+                    book_desc,
+                    current_token,
+                    prompt_generation_attempt,
+                ),
+            )
+            if prompt_errors:
+                current_cycle_errors.extend([f"prompt: {msg}" for msg in prompt_errors])
+
+            if not draw_prompt:
+                log.warning(
+                    "⚠️ 封面生成模块第 %d 次失败：当前全部 token 仍未生成有效提示词。错误摘要：%s；系统将持续重试提示词生成，直到成功为止。",
+                    attempt,
+                    " | ".join(current_cycle_errors[-5:]) if current_cycle_errors else "无",
+                )
+                time.sleep(min(30, 5 + attempt))
+                continue
+
+            cached_draw_prompt = draw_prompt
+        else:
+            log.info("🧠 第 %d 次封面重试将复用上一次成功生成的生图提示词，不再重新生成提示词。", attempt)
+
+        total_image_failures = 0
+        all_image_failures_are_429 = True
+        for model_index, (image_model, model_label) in enumerate(image_model_sequence, start=1):
+            model_result = _try_generate_cover_with_image_model(
+                output_path=output_path,
+                draw_prompt=draw_prompt,
+                img_size=img_size,
+                image_model=image_model,
+                token_candidates=token_pool,
+            )
+            if model_result["success"]:
+                return True
+
+            if model_result["errors"]:
+                current_cycle_errors.extend([f"{image_model}: {msg}" for msg in model_result["errors"]])
+            total_image_failures += int(model_result["failure_count"] or 0)
+            if not model_result["all_failures_are_429"]:
+                all_image_failures_are_429 = False
+
+            if model_index < len(image_model_sequence):
+                log.warning(
+                    "⚠️ %s 在当前全部可用 token 上都生成失败，开始自动切换到 %s 再完整重试一轮。",
+                    image_model,
+                    image_model_sequence[model_index][0],
+                )
+
+        if total_image_failures > 0 and all_image_failures_are_429:
+            raise RuntimeError(
+                "同一个封面提示词已在全部可用 token 的两种生图模型上全部触发 429，停止运行。错误摘要：%s"
+                % (" | ".join(current_cycle_errors[-8:]) if current_cycle_errors else "无")
+            )
+
+        log.warning(
+            "⚠️ 封面生成模块第 %d 次失败：Qwen 生图与 Tongyi 回退生图都已在当前可用 token 上完整尝试仍未成功。错误摘要：%s；系统将持续复用当前提示词重试生图，直到成功为止。",
+            attempt,
+            " | ".join(current_cycle_errors[-6:]) if current_cycle_errors else "无",
+        )
+        time.sleep(min(30, 5 + attempt))
 
 
 def auto_create_youtube_seo(book_name, book_desc, output_path, token):
